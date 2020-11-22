@@ -29,50 +29,101 @@ export class EventBus<T extends EventBusModel> {
     // 发射事件
     public emit(eventBusModel: EventBusModel) {
         let event = this.createInstance(eventBusModel['__ob__'], eventBusModel.type, eventBusModel.subType, eventBusModel.data);
+        Object.keys(this.eventStrategy[event.type]).forEach(key => {
+            Utils.def(this.eventStrategy[event.type][key], 'alreadyCalled', false, false);
+        })
         this.busSubject.next(event);
     }
 
     // 捕获事件
-    public on(key: string, callback: Function, context?) {
+    public on(context, callback?: Function) {
+        const key = context.constructor.name;
         if (this.subscribeGroup.has(key)) {
             return this.subscribeGroup.get(key)
         }
+        this.$on({key, callback, context});
+        return ;
+    }
+
+    private $on(obj: {
+        key: string,
+        callback: Function,
+        context
+    }) {
         let subscribe: Subscriber<any>;
-        if (callback) {
+        try {
+            subscribe = this.busSubject.subscribe(
+                this.next(obj.callback, obj.context, obj.key, subscribe),
+                this.error(obj.key, subscribe, obj.callback)
+            ) as Subscriber<any>;
+            this.subscribeGroup.set(obj.key, subscribe);
+        } catch (ex) {
+            this.error(obj.key, subscribe, obj.callback)(ex);
+        }
+    }
+
+    private next(callback: Function, context, key, subscribe) {
+        let name = context.constructor.name;
+        let self = context;
+        return (val: T) => {
             try {
-                subscribe = this.busSubject.subscribe(
-                    (val: T) => {
-                        try {
-                            const name = context.constructor.name;
-                            const cb = this.eventStrategy[val.type][name]['__cb__'];
-                            if (cb) {
-                                cb.context = context;
-                            }
-                            if (val.subType) {
-                                this.eventStrategy[val.type][val.subType].apply(context, [val]);
-                            } else {
-                                if(Utils.isPlainObject(val['__ob__'][val.type])) {
-                                    cb.reset();
-                                } else {
-                                    callback.apply(context, [val]);
-                                }
-                            }
-                        } catch (ex) {
-                            console.error(ex);
-                            // 异常了会取消订阅信息？？？， 重新加上订阅信息
-                            this.reon(key, subscribe, callback);
+                let cb = this.eventStrategy[val.type]['__cb__'];
+                if (!cb) {
+                    const obj = this.eventStrategy[val.type][name];
+                    if (obj) {
+                        cb = this.eventStrategy[val.type][name]['__cb__'];
+                    }
+                }
+                //
+                if (cb) {
+                    cb.context = self;
+                }
+                if (!cb && !callback) {
+                    console.warn(`${val.type} - ${name} 没有提供回调方法`);
+                    return;
+                }
+
+                if (val.subType) {
+                    this.callFun(this.eventStrategy[val.type], self, val);
+                } else {
+                    if(Utils.isPlainObject(val['__ob__'][val.type])) {
+                        cb.reset();
+                    } else {
+                        if (callback) {
+                            callback.apply(self, [val]);
+                        } else {
+                            this.callFun(this.eventStrategy[val.type][name], self, val);
                         }
-                    }, error => {
-                        console.error(error);
-                        this.reon(key, subscribe, callback);
-                    }) as Subscriber<any>;
+                    }
+                }
             } catch (ex) {
                 console.error(ex);
+                // 异常了会取消订阅信息？？？， 重新加上订阅信息
                 this.reon(key, subscribe, callback);
             }
-            this.subscribeGroup.set(key, subscribe);
         }
-        return subscribe;
+    }
+
+    /**
+     * 如果多个组件都on了同一个事件，如果发送
+     */
+    private callFun(fun, context, val) {
+        if (fun) {
+            const alreadyCalled = fun['alreadyCalled'] || false;
+            if (alreadyCalled) {
+                console.log(`${val.type} - ${context.constructor.name} alreadyCalled`);
+                return;
+            }
+            fun['func'].apply(context, [val.data]);
+            fun['alreadyCalled'] = true;
+        }
+    }
+
+    private error(key, subscribe, callback) {
+        return error => {
+            console.error(error);
+            this.reon(key, subscribe, callback);
+        }
     }
 
     private reon(key: string, subscribe: Subscriber<any>, callback) {
@@ -84,10 +135,11 @@ export class EventBus<T extends EventBusModel> {
     }
 
     // 注销事件
-    public off(key: string) {
+    public off(key?: string) {
         if (this.subscribeGroup.size === 0) {
             return true;
         }
+        key = Utils.getSubKey();
         if (key) {
             if (this.subscribeGroup.has(key)) {
                 this.subscribeGroup.get(key).unsubscribe();
@@ -111,7 +163,6 @@ export class EventBus<T extends EventBusModel> {
         keys.forEach(key => {
             if (Utils.isPlainObject(T[key])) {
                 this.walk(key);
-                Utils.def(this.eventStrategy[key], 'count', Object.keys(T[key]).length);
                 Object.keys(T[key]).forEach(element => {
                     this.proxy(this[key], key, element);
                     this.defineReactive(this.eventStrategy[key], element, (args) => {
@@ -123,7 +174,7 @@ export class EventBus<T extends EventBusModel> {
                         }
                     });
                 });
-                Utils.def(this.eventStrategy[key], '__cb__', new CyclicBarrier(Object.keys(T[key]).length, this.eventStrategy[key], this));
+                Utils.def(this.eventStrategy[key], '__c__', Object.keys(T[key]).length, false);
             } else {
                 this.walk(key);
             }
@@ -175,7 +226,7 @@ export class EventBus<T extends EventBusModel> {
                 }
             }
         })
-    } 
+    }
 
     private proxy(target: Object, sourceKey: string, key: string) {
 
@@ -197,17 +248,17 @@ export class EventBus<T extends EventBusModel> {
         }
         sharedPropertyDefinition.set =  (val, context?) => {
             const subKey = Utils.getSubKey();
-            const cb = this[sourceKey][key]['__cb__'];
+            const c = this[sourceKey][key]['__c__'];
             if (subKey || this.constructor.name !== subKey) {
-                this[sourceKey][key][subKey] = val;
-                if (cb) {
-                    this[sourceKey][key][subKey]['__cb__'] = new CyclicBarrier(cb.count, val, this);
-                }
+                this[sourceKey][key][subKey] = {'func': val};
+                //if (cb) {
+                    this[sourceKey][key][subKey]['__cb__'] = new CyclicBarrier(c || 1, val, this);
+                //}
             } else {
-                this[sourceKey][key] = val;
-                if (cb) {
-                    this[sourceKey][key]['__cb__'] = new CyclicBarrier(cb.count, val, this);
-                }
+                this[sourceKey][key] = {'func': val};
+                //if (cb) {
+                    this[sourceKey][key]['__cb__'] = new CyclicBarrier(c || 1, val, this);
+                //}
             }
         }
         Object.defineProperty(target, key, sharedPropertyDefinition);
@@ -217,7 +268,7 @@ export class EventBus<T extends EventBusModel> {
         this.proxy(this, 'eventStrategy', key);
         this.defineReactive(this.eventStrategy, key, (...args) => {
             console.warn(`warn: ${key}`)
-        }); 
+        });
     }
 }
 
@@ -299,7 +350,7 @@ class Utils {
     public static getSubKey() {
         try {
             const stack = new Error('').stack;
-            const subKey = stack.match(/((?<=at[^\r\n\f]*)((?:\S*)(?=\.<anonymous>))|(?<=at[^\r\n\f]+new[^S])([^\s]+))/g);
+            const subKey = stack.match(/((?<=at[^\r\n\f]*)((?:\S*)(?=\.<anonymous>))|(?<=at[^\r\n\f]+new[^S])([^\s]+)|(?<=at[^\r\n\f])((?!Function).)+(?=\.push))/g);
             if (!subKey) {
                 //throw arguments.callee;
             }
